@@ -28,5 +28,5 @@ serde_json = "1.0"
 rmp-serde = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = { version = "0.20.0", features = ["native-tls"] }
 uuid = { version = "1.0", features = ["v4"] }
+yawc = { version = "0.5.0", default-features = false, features = ["rustls-aws-lc-rs"] }

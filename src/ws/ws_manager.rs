@@ -14,16 +14,11 @@ use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    net::TcpStream,
     spawn,
     sync::{mpsc::UnboundedSender, Mutex},
     time,
 };
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{self, protocol},
-    MaybeTlsStream, WebSocketStream,
-};
+use yawc::{Frame, OpCode, TcpWebSocket, WebSocket};
 
 use crate::{
     prelude::*,
@@ -41,10 +36,9 @@ struct SubscriptionData {
     subscription_id: u32,
     id: String,
 }
-#[derive(Debug)]
 pub(crate) struct WsManager {
     stop_flag: Arc<AtomicBool>,
-    writer: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, protocol::Message>>>,
+    writer: Arc<Mutex<SplitSink<TcpWebSocket, Frame>>>,
     subscriptions: Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
     subscription_id: u32,
     subscription_identifiers: HashMap<u32, String>,
@@ -197,7 +191,7 @@ impl WsManager {
                     match serde_json::to_string(&Ping { method: "ping" }) {
                         Ok(payload) => {
                             let mut writer = writer.lock().await;
-                            if let Err(err) = writer.send(protocol::Message::Text(payload)).await {
+                            if let Err(err) = writer.send(Frame::text(payload)).await {
                                 error!("Error pinging server: {err}")
                             }
                         }
@@ -219,11 +213,11 @@ impl WsManager {
         })
     }
 
-    async fn connect(url: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        Ok(connect_async(url)
+    async fn connect(url: &str) -> Result<TcpWebSocket> {
+        let url = url.parse().map_err(|e| Error::Websocket(format!("{e}")))?;
+        WebSocket::connect(url)
             .await
-            .map_err(|e| Error::Websocket(e.to_string()))?
-            .0)
+            .map_err(|e| Error::Websocket(e.to_string()))
     }
 
     fn get_identifier(message: &Message) -> Result<String> {
@@ -300,48 +294,41 @@ impl WsManager {
     }
 
     async fn parse_and_send_data(
-        data: std::result::Result<protocol::Message, tungstenite::Error>,
+        frame: Frame,
         subscriptions: &Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
     ) -> Result<()> {
-        match data {
-            Ok(data) => match data.into_text() {
-                Ok(data) => {
-                    if !data.starts_with('{') {
-                        return Ok(());
-                    }
-                    let message = serde_json::from_str::<Message>(&data)
-                        .map_err(|e| Error::JsonParse(e.to_string()))?;
-                    let identifier = WsManager::get_identifier(&message)?;
-                    if identifier.is_empty() {
-                        return Ok(());
-                    }
+        if frame.opcode() != OpCode::Text {
+            return Ok(());
+        }
+        match std::str::from_utf8(frame.payload()) {
+            Ok(data) => {
+                if !data.starts_with('{') {
+                    return Ok(());
+                }
+                let message = serde_json::from_str::<Message>(data)
+                    .map_err(|e| Error::JsonParse(e.to_string()))?;
+                let identifier = WsManager::get_identifier(&message)?;
+                if identifier.is_empty() {
+                    return Ok(());
+                }
 
-                    let mut subscriptions = subscriptions.lock().await;
-                    let mut res = Ok(());
-                    if let Some(subscription_datas) = subscriptions.get_mut(&identifier) {
-                        for subscription_data in subscription_datas {
-                            if let Err(e) = subscription_data
-                                .sending_channel
-                                .send(message.clone())
-                                .map_err(|e| Error::WsSend(e.to_string()))
-                            {
-                                res = Err(e);
-                            }
+                let mut subscriptions = subscriptions.lock().await;
+                let mut res = Ok(());
+                if let Some(subscription_datas) = subscriptions.get_mut(&identifier) {
+                    for subscription_data in subscription_datas {
+                        if let Err(e) = subscription_data
+                            .sending_channel
+                            .send(message.clone())
+                            .map_err(|e| Error::WsSend(e.to_string()))
+                        {
+                            res = Err(e);
                         }
                     }
-                    res
                 }
-                Err(err) => {
-                    let error = Error::ReaderTextConversion(err.to_string());
-                    Ok(WsManager::send_to_all_subscriptions(
-                        subscriptions,
-                        Message::HyperliquidError(error.to_string()),
-                    )
-                    .await?)
-                }
-            },
+                res
+            }
             Err(err) => {
-                let error = Error::GenericReader(err.to_string());
+                let error = Error::ReaderTextConversion(err.to_string());
                 Ok(WsManager::send_to_all_subscriptions(
                     subscriptions,
                     Message::HyperliquidError(error.to_string()),
@@ -373,7 +360,7 @@ impl WsManager {
 
     async fn send_subscription_data(
         method: &'static str,
-        writer: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, protocol::Message>,
+        writer: &mut SplitSink<TcpWebSocket, Frame>,
         identifier: &str,
     ) -> Result<()> {
         let payload = serde_json::to_string(&SubscriptionSendData {
@@ -384,21 +371,21 @@ impl WsManager {
         .map_err(|e| Error::JsonParse(e.to_string()))?;
 
         writer
-            .send(protocol::Message::Text(payload))
+            .send(Frame::text(payload))
             .await
             .map_err(|e| Error::Websocket(e.to_string()))?;
         Ok(())
     }
 
     async fn subscribe(
-        writer: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, protocol::Message>,
+        writer: &mut SplitSink<TcpWebSocket, Frame>,
         identifier: &str,
     ) -> Result<()> {
         Self::send_subscription_data("subscribe", writer, identifier).await
     }
 
     async fn unsubscribe(
-        writer: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, protocol::Message>,
+        writer: &mut SplitSink<TcpWebSocket, Frame>,
         identifier: &str,
     ) -> Result<()> {
         Self::send_subscription_data("unsubscribe", writer, identifier).await
@@ -487,6 +474,18 @@ impl WsManager {
             Self::unsubscribe(self.writer.lock().await.borrow_mut(), identifier.as_str()).await?;
         }
         Ok(())
+    }
+}
+
+// yawc's socket isn't Debug, and InfoClient (public, Debug) holds a WsManager.
+impl std::fmt::Debug for WsManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsManager")
+            .field("stop_flag", &self.stop_flag)
+            .field("subscriptions", &self.subscriptions)
+            .field("subscription_id", &self.subscription_id)
+            .field("subscription_identifiers", &self.subscription_identifiers)
+            .finish_non_exhaustive()
     }
 }
 
