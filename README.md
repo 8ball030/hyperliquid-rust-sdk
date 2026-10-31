@@ -4,7 +4,7 @@ SDK for Hyperliquid API trading with Rust.
 
 ## Usage Examples
 
-See `src/bin` for examples. You can run any example with `cargo run --bin [EXAMPLE]`.
+See `examples` for examples. You can run any example with `cargo run --example [EXAMPLE]`.
 
 ## Installation
 
